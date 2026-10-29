@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ENB Viewer</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);
+--bg:#f5f7f6;--surface:#fff;--text:#16211c;--muted:#5d6b64;--accent:#1f7a52;--border:#d5ddd8}
+html{scroll-padding-top:env(safe-area-inset-top,0px);height:100%}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0d1511;--surface:#16211c;--text:#e8f0ec;--muted:#93a39a;--accent:#4cc38a;--border:#2a3a32}}
+:root[data-theme="dark"]{--bg:#0d1511;--surface:#16211c;--text:#e8f0ec;--muted:#93a39a;--accent:#4cc38a;--border:#2a3a32}
+*,*::before,*::after{box-sizing:inherit}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;min-height:100%}
+header{padding:16px 16px 8px;max-width:1100px;margin:0 auto}
+h1{font-size:1.3rem;margin:0 0 4px}
+p.sub{margin:0;color:var(--muted);font-size:.9rem}
+main{max-width:1100px;margin:0 auto;padding:8px 16px 32px}
+#drop{display:block;border:2px dashed var(--border);background:var(--surface);border-radius:14px;padding:28px 16px;text-align:center;cursor:pointer;transition:.15s}
+#drop.over{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,var(--surface))}
+#drop strong{color:var(--accent)}
+button{font:inherit;border:1px solid var(--border);background:var(--surface);color:var(--text);border-radius:10px;padding:8px 12px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+#viewer{display:none;margin-top:14px}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
+.bar .grow{flex:1;min-width:8px}
+#name{color:var(--muted);font-size:.85rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+#wrap{overflow:auto;border:1px solid var(--border);border-radius:12px;background:#0f271e;max-height:78vh;-webkit-overflow-scrolling:touch}
+canvas{display:block;width:100%;height:auto}
+#msg{color:var(--muted);font-size:.85rem;margin-top:8px}
+#file{margin-top:10px;max-width:100%;font:inherit;color:var(--muted)}
+#err{color:#c0392b;margin-top:10px}
+</style>
+</head>
+<body>
+<header>
+<h1>ENB Viewer</h1>
+<p class="sub">Open smartboard .enb files in your browser. Nothing is uploaded: files are read on your device.</p>
+</header>
+<main>
+<label id="drop" for="file">
+<div><strong>Tap to choose</strong> or drop a .enb file here</div>
+</label>
+<input id="file" type="file" accept=".enb,.zip,application/zip,application/octet-stream">
+<div id="err"></div>
+<section id="viewer">
+<div class="bar">
+<button id="prev">‹ Prev</button>
+<span id="pos">1 / 1</span>
+<button id="next">Next ›</button>
+<span class="grow"></span>
+<button id="zout" aria-label="Zoom out">−</button>
+<span id="zl">100%</span>
+<button id="zin" aria-label="Zoom in">+</button>
+<button id="dl" class="primary">Download PNG</button>
+</div>
+<div id="name"></div>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<div id="msg"></div>
+</section>
+</main>
+<script>
+(function(){
+var $=function(i){return document.getElementById(i)};
+var slides=[],cur=0,zoom=100,fname='slide';
+var drop=$('drop'),file=$('file');
+['dragenter','dragover'].forEach(function(t){drop.addEventListener(t,function(e){e.preventDefault();drop.classList.add('over')})});
+['dragleave','drop'].forEach(function(t){drop.addEventListener(t,function(e){e.preventDefault();drop.classList.remove('over')})});
+drop.addEventListener('drop',function(e){if(e.dataTransfer.files[0])load(e.dataTransfer.files[0])});
+file.onchange=function(){if(file.files[0])load(file.files[0])};
+
+function num(n){var m=n.match(/Slide_(\d+)\.(xml|png)$/i);return m?+m[1]:null}
+function col(c){c=c||'#FFFFFFFF';c=c.replace('#','');return '#'+(c.length===8?c.slice(2):c)}
+
+async function unzip(buf){
+  var dv=new DataView(buf),u8=new Uint8Array(buf),n=u8.length,e=-1,i;
+  for(i=n-22;i>=Math.max(0,n-65558);i--){if(dv.getUint32(i,true)===0x06054b50){e=i;break}}
+  if(e<0)throw new Error('This does not look like a valid .enb (zip) file.');
+  var cnt=dv.getUint16(e+10,true),off=dv.getUint32(e+16,true),out=[];
+  for(var k=0;k<cnt;k++){
+    if(dv.getUint32(off,true)!==0x02014b50)break;
+    var nl=dv.getUint16(off+28,true),el=dv.getUint16(off+30,true),cl=dv.getUint16(off+32,true);
+    out.push({name:new TextDecoder().decode(u8.subarray(off+46,off+46+nl)),meth:dv.getUint16(off+10,true),csz:dv.getUint32(off+20,true),lo:dv.getUint32(off+42,true)});
+    off+=46+nl+el+cl;
+  }
+  async function read(en){
+    var lo=en.lo,start=lo+30+dv.getUint16(lo+26,true)+dv.getUint16(lo+28,true),raw=u8.subarray(start,start+en.csz);
+    if(en.meth===0)return raw;
+    if(en.meth!==8)throw new Error('Unsupported compression in file.');
+    if(typeof DecompressionStream==='undefined')throw new Error('This browser is too old. Please update Chrome or Safari.');
+    var st=new Blob([raw]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+    return new Uint8Array(await new Response(st).arrayBuffer());
+  }
+  return{entries:out,read:read};
+}
+
+async function load(f){
+  $('err').textContent='';
+  try{
+    var z=await unzip(await f.arrayBuffer()),map={};
+    z.entries.forEach(function(en){var n=num(en.name);if(n===null)return;
+      (map[n]=map[n]||{})[/\.png$/i.test(en.name)?'png':'xml']=en});
+    var ids=Object.keys(map).map(Number).sort(function(a,b){return a-b});
+    if(!ids.length)throw new Error('No slides found. Is this a valid .enb file?');
+    slides=[];
+    for(var i=0;i<ids.length;i++){
+      var m=map[ids[i]],s={els:[],bg:'#0F271E',thumb:null,skipped:0};
+      if(m.xml)parse(new TextDecoder().decode(await z.read(m.xml)),s);
+      if(m.png)s.thumb=new Blob([await z.read(m.png)],{type:'image/png'});
+      slides.push(s);
+    }
+    fname=f.name.replace(/\.[^.]+$/,'');
+    $('name').textContent=f.name;
+    cur=0;zoom=100;$('viewer').style.display='block';show();
+  }catch(e){$('err').textContent='Error: '+e.message}
+}
+
+function parse(xml,s){
+  var d=new DOMParser().parseFromString(xml,'text/xml');
+  var bg=d.querySelector('Data > BackgroundValue');if(bg)s.bg=col(bg.textContent);
+  d.querySelectorAll('Package').forEach(function(p){
+    var t=p.getAttribute('Type');
+    if(t!=='Ink'&&t!=='StraightLine'){if(t!=='Slide')s.skipped++;return}
+    var pe=p.querySelector('Points');if(!pe)return;
+    var pts=pe.textContent.split(';').filter(Boolean).map(function(q){var a=q.split(',');return[+a[0],+a[1]]});
+    var c=p.querySelector('ForegroundColor'),th=p.querySelector('Thickness');
+    s.els.push({pts:pts,c:col(c&&c.textContent),w:th?+th.textContent:3});
+  });
+}
+
+function draw(s){
+  var cv=$('cv'),ctx=cv.getContext('2d');
+  if(!s.els.length){
+    if(!s.thumb)return;
+    var img=new Image();img.onload=function(){cv.width=img.width;cv.height=img.height;cv.getContext('2d').drawImage(img,0,0)};
+    img.src=URL.createObjectURL(s.thumb);return;
+  }
+  var x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
+  s.els.forEach(function(e){e.pts.forEach(function(p){if(p[0]<x0)x0=p[0];if(p[0]>x1)x1=p[0];if(p[1]<y0)y0=p[1];if(p[1]>y1)y1=p[1]})});
+  var mg=150;x0-=mg;y0-=mg;x1+=mg;y1+=mg;
+  var sc=2400/(x1-x0);if((y1-y0)*sc>14000)sc=14000/(y1-y0);
+  cv.width=Math.round((x1-x0)*sc);cv.height=Math.round((y1-y0)*sc);
+  ctx.fillStyle=s.bg;ctx.fillRect(0,0,cv.width,cv.height);
+  ctx.lineCap='round';ctx.lineJoin='round';
+  s.els.forEach(function(e){
+    ctx.strokeStyle=e.c;ctx.fillStyle=e.c;ctx.lineWidth=Math.max(2.5,e.w*sc*2);
+    ctx.beginPath();
+    e.pts.forEach(function(p,i){var X=(p[0]-x0)*sc,Y=(p[1]-y0)*sc;i?ctx.lineTo(X,Y):ctx.moveTo(X,Y)});
+    if(e.pts.length===1){ctx.arc((e.pts[0][0]-x0)*sc,(e.pts[0][1]-y0)*sc,ctx.lineWidth/2,0,7);ctx.fill()}else ctx.stroke();
+  });
+}
+
+function show(){
+  var s=slides[cur];draw(s);
+  $('pos').textContent=(cur+1)+' / '+slides.length;
+  $('prev').disabled=cur===0;$('next').disabled=cur===slides.length-1;
+  $('msg').textContent=s.els.length?(s.els.length+' pen and line strokes drawn'+(s.skipped?'; '+s.skipped+' other items (text or images) are not supported yet':'')):'No vector strokes found, showing the saved preview image.';
+  setZoom(zoom);$('wrap').scrollTop=0;
+}
+function setZoom(z){zoom=Math.max(50,Math.min(400,z));$('cv').style.width=zoom+'%';$('zl').textContent=zoom+'%'}
+$('prev').onclick=function(){if(cur>0){cur--;show()}};
+$('next').onclick=function(){if(cur<slides.length-1){cur++;show()}};
+$('zin').onclick=function(){setZoom(zoom+25)};
+$('zout').onclick=function(){setZoom(zoom-25)};
+$('dl').onclick=function(){$('cv').toBlob(function(b){var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=fname+'-slide-'+(cur+1)+'.png';document.body.appendChild(a);a.click();a.remove()})};
+document.addEventListener('keydown',function(e){if(!slides.length)return;if(e.key==='ArrowLeft')$('prev').click();if(e.key==='ArrowRight')$('next').click()});
+})();
+</script>
+</body>
+</html>
